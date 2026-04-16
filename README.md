@@ -165,9 +165,11 @@ Security audits are fully isolated between layers.
 
 ## Verification
 
-**176 checks, 0 failures.**
+**270 tests, 0 failures. 85 Kani proof harnesses.**
 
-### Kani Proofs (35 harnesses)
+The `percolator_program` field in the `StakePool` account is an allowlist of authorized wrapper program IDs. Only programs on this allowlist can receive CPI calls from the stake program. This is the fix for finding F-4 (unauthorized program CPI).
+
+### Kani Proofs (85 harnesses)
 
 Uses `#[kani::unwind(33)]` with u32 mirrors for CBMC tractability. Properties proven over bounded domains generalize to production u64/u128 via scale invariance.
 
@@ -190,7 +192,7 @@ Uses `#[kani::unwind(33)]` with u32 mirrors for CBMC tractability. Properties pr
 
 See [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) for the full proof-by-proof analysis.
 
-### Tests (141)
+### Tests (270)
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
@@ -200,6 +202,7 @@ See [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) for the full proo
 | Struct Layout | 10 | Bytemuck serialization roundtrips |
 | CPI Tags | 9 | All wrapper instruction tags verified |
 | Error Codes | 3 | Error variant mapping |
+| Integration | 129 | End-to-end program flows, percolator_program allowlist |
 
 ## Audit
 
