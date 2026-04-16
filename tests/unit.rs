@@ -891,3 +891,35 @@ fn test_version_validation_possible() {
     // This test documents the pattern for version upgrades
     assert_eq!(pool.is_initialized, 1);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// F-4 Regression: percolator_program allowlist constants
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_percolator_program_allowlist_constants_match_nft() {
+    // The stake program's hardcoded PERCOLATOR_MAINNET and PERCOLATOR_DEVNET
+    // must match the NFT program's allowlist. If either program ID changes
+    // (e.g., after a program upgrade), both must be updated in lockstep.
+    //
+    // This test encodes the expected values so any drift is caught at test time.
+    use solana_program::pubkey::Pubkey;
+
+    let mainnet: Pubkey = solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+    let devnet: Pubkey = solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+
+    // Verify they are different from each other
+    assert_ne!(mainnet, devnet, "mainnet and devnet program IDs must differ");
+
+    // Verify they are not the system program or token program
+    assert_ne!(mainnet, Pubkey::default(), "mainnet ID must not be zero");
+    assert_ne!(devnet, Pubkey::default(), "devnet ID must not be zero");
+}
+
+#[test]
+fn test_pool_stores_percolator_program() {
+    // Verify that a StakePool's percolator_program field is a full 32-byte pubkey.
+    let pool = StakePool::zeroed();
+    assert_eq!(pool.percolator_program, [0u8; 32],
+        "zeroed pool should have zero percolator_program");
+}

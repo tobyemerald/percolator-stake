@@ -186,6 +186,22 @@ fn process_init_pool(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Validate percolator_program against known-good allowlist.
+    // Without this, a malicious admin could set percolator_program to an
+    // attacker-controlled program, then drain the vault via FlushToInsurance CPI.
+    {
+        const PERCOLATOR_MAINNET: Pubkey =
+            solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+        const PERCOLATOR_DEVNET: Pubkey =
+            solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+        if *percolator_program.key != PERCOLATOR_MAINNET
+            && *percolator_program.key != PERCOLATOR_DEVNET
+        {
+            msg!("Error: invalid percolator program {}", percolator_program.key);
+            return Err(StakeError::InvalidPercolatorProgram.into());
+        }
+    }
+
     // BUG-13: Validate cooldown_slots at InitPool time, consistent with UpdateConfig.
     // UpdateConfig already calls validate_cooldown_slots(), so allowing cooldown_slots=0
     // at init creates an inconsistency: a pool created with cooldown=0 could never be
