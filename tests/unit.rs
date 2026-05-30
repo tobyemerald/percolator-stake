@@ -509,9 +509,15 @@ fn test_decode_update_config_none() {
 
 #[test]
 fn test_tombstoned_admin_tags_rejected() {
-    // Tags 5, 6, 7, 8, 9, 11 were admin CPI proxies — now tombstoned
-    for tag in [5u8, 6, 7, 8, 9, 11] {
-        assert!(StakeInstruction::unpack(&[tag]).is_err(), "tag {} should be rejected", tag);
+    // Tags 7, 8, 9, 11 remain tombstoned (former admin CPI proxies).
+    // Tags 5/6 were RECLAIMED for two-step admin rotation (ProposeAdmin/AcceptAdmin)
+    // in v2 — see instruction.rs tests for their positive decode coverage.
+    for tag in [7u8, 8, 9, 11] {
+        assert!(
+            StakeInstruction::unpack(&[tag]).is_err(),
+            "tag {} should be rejected",
+            tag
+        );
     }
 }
 
@@ -520,7 +526,10 @@ fn test_decode_return_insurance() {
     let mut data = vec![10u8];
     data.extend_from_slice(&5_000_000u64.to_le_bytes());
     let ix = StakeInstruction::unpack(&data).unwrap();
-    assert!(matches!(ix, StakeInstruction::ReturnInsurance { amount: 5_000_000 }));
+    assert!(matches!(
+        ix,
+        StakeInstruction::ReturnInsurance { amount: 5_000_000 }
+    ));
 }
 
 #[test]
@@ -909,7 +918,10 @@ fn test_percolator_program_allowlist_constants_match_nft() {
     let devnet: Pubkey = solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
 
     // Verify they are different from each other
-    assert_ne!(mainnet, devnet, "mainnet and devnet program IDs must differ");
+    assert_ne!(
+        mainnet, devnet,
+        "mainnet and devnet program IDs must differ"
+    );
 
     // Verify they are not the system program or token program
     assert_ne!(mainnet, Pubkey::default(), "mainnet ID must not be zero");
@@ -920,6 +932,8 @@ fn test_percolator_program_allowlist_constants_match_nft() {
 fn test_pool_stores_percolator_program() {
     // Verify that a StakePool's percolator_program field is a full 32-byte pubkey.
     let pool = StakePool::zeroed();
-    assert_eq!(pool.percolator_program, [0u8; 32],
-        "zeroed pool should have zero percolator_program");
+    assert_eq!(
+        pool.percolator_program, [0u8; 32],
+        "zeroed pool should have zero percolator_program"
+    );
 }

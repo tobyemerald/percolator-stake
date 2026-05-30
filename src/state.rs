@@ -98,6 +98,17 @@ pub struct StakePool {
     /// Padding for alignment
     pub _mode_padding: [u8; 7],
 
+    /// Two-step admin rotation (v2): the proposed next admin. Zero = no pending
+    /// proposal. ProposeAdmin (current admin signs) sets it; AcceptAdmin
+    /// (pending_admin signs) consumes it (admin = pending_admin; pending = 0).
+    /// Proposing zero cancels an outstanding proposal.
+    ///
+    /// This is a real struct field (offset 288), NOT carved from `_reserved`:
+    /// only 13 bytes [51..64] were free there, < 32. Adding it grows
+    /// STAKE_POOL_SIZE 352 -> 384 and is why CURRENT_VERSION bumps 1 -> 2.
+    /// Fresh-start cutover: no v1 pools exist, so no migration is needed.
+    pub pending_admin: [u8; 32],
+
     /// Reserved for future use
     pub _reserved: [u8; 64],
 }
@@ -180,6 +191,16 @@ impl StakePool {
 
     pub fn percolator_program_pubkey(&self) -> Pubkey {
         Pubkey::new_from_array(self.percolator_program)
+    }
+
+    /// The pending (proposed) admin for the two-step rotation, or None if no
+    /// proposal is outstanding (pending_admin == zero).
+    pub fn pending_admin_pubkey(&self) -> Option<Pubkey> {
+        if self.pending_admin == [0u8; 32] {
+            None
+        } else {
+            Some(Pubkey::new_from_array(self.pending_admin))
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -277,9 +298,7 @@ impl StakePool {
     pub fn effective_junior_balance(&self) -> u64 {
         let jb = self.junior_balance();
         // net_loss = total_flushed - total_returned (tokens sent to insurance but not yet returned)
-        let net_loss = self
-            .total_flushed
-            .saturating_sub(self.total_returned);
+        let net_loss = self.total_flushed.saturating_sub(self.total_returned);
         if net_loss == 0 {
             return jb;
         }
@@ -305,11 +324,13 @@ impl StakePool {
 
     /// Derived: senior balance = total_pool_value - effective_junior_balance.
     pub fn senior_balance(&self) -> Option<u64> {
-        self.total_pool_value()?.checked_sub(self.effective_junior_balance())
+        self.total_pool_value()?
+            .checked_sub(self.effective_junior_balance())
     }
 
     /// Current struct version. Increment when layout changes.
-    pub const CURRENT_VERSION: u8 = 1;
+    /// v2 (size 352 -> 384): added `pending_admin` for two-step admin rotation.
+    pub const CURRENT_VERSION: u8 = 2;
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
     /// Call on init.
@@ -488,8 +509,10 @@ mod tests {
     fn test_stake_pool_size() {
         // Ensure struct is packed correctly (no surprise padding)
         assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
-        // Check expected size: 1+1+1+1+4 + 5*32 + 7*8 + 32 + 96 = 8 + 160 + 56 + 32 + 96 = 352
-        assert_eq!(STAKE_POOL_SIZE, 352);
+        // v2 size: prior 352 + pending_admin[32] = 384.
+        // 1+1+1+1+4 + 5*32 + 7*8 + 32(percolator_program) + 24(PERC-272 u64s)
+        //   + 1(pool_mode) + 7(mode_pad) + 32(pending_admin) + 64(_reserved) = 384
+        assert_eq!(STAKE_POOL_SIZE, 384);
     }
 
     #[test]
@@ -785,7 +808,11 @@ mod tests {
             disc_before, disc_after,
             "HWM must not clobber discriminator"
         );
-        assert_eq!(pool.version(), 1, "HWM must not clobber version");
+        assert_eq!(
+            pool.version(),
+            StakePool::CURRENT_VERSION,
+            "HWM must not clobber version"
+        );
     }
 
     // ── PERC-8422: PR#94 State Collision Unit Tests ──

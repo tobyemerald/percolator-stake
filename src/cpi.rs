@@ -110,6 +110,10 @@ mod tag_tests {
         let decoded = u128::from_le_bytes(data[1..17].try_into().unwrap());
         assert_eq!(decoded, amount as u128, "amount must round-trip as u128 LE");
         // Guard against regression to the broken 8-byte u64 wire.
-        assert_ne!(data.len(), 9, "8-byte u64 wire is the pre-v16 break — must NOT ship");
+        assert_ne!(
+            data.len(),
+            9,
+            "8-byte u64 wire is the pre-v16 break — must NOT ship"
+        );
     }
 }

@@ -134,6 +134,10 @@ pub fn process(
             new_cooldown_slots,
             new_deposit_cap,
         } => process_update_config(program_id, accounts, new_cooldown_slots, new_deposit_cap),
+        StakeInstruction::ProposeAdmin { new_admin } => {
+            process_propose_admin(program_id, accounts, new_admin)
+        }
+        StakeInstruction::AcceptAdmin => process_accept_admin(program_id, accounts),
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
@@ -152,9 +156,7 @@ pub fn process(
         StakeInstruction::DepositJunior { amount } => {
             process_deposit_junior(program_id, accounts, amount)
         }
-        StakeInstruction::SetMarketResolved => {
-            process_set_market_resolved(program_id, accounts)
-        }
+        StakeInstruction::SetMarketResolved => process_set_market_resolved(program_id, accounts),
     }
 }
 
@@ -197,7 +199,10 @@ fn process_init_pool(
         if *percolator_program.key != PERCOLATOR_MAINNET
             && *percolator_program.key != PERCOLATOR_DEVNET
         {
-            msg!("Error: invalid percolator program {}", percolator_program.key);
+            msg!(
+                "Error: invalid percolator program {}",
+                percolator_program.key
+            );
             return Err(StakeError::InvalidPercolatorProgram.into());
         }
     }
@@ -313,6 +318,16 @@ fn process_init_pool(
     pool.total_returned = 0;
     pool.total_withdrawn = 0;
     pool.percolator_program = percolator_program.key.to_bytes();
+    // PERC-272 + two-step admin: explicit zero (defense-in-depth). The PDA is
+    // zero-filled at create_account so these are already 0, but explicit init
+    // documents genesis state and guards against any future non-zeroed alloc.
+    // In particular total_fees_earned MUST start at 0 so the first AccrueFees
+    // pre-seed guard (total_lp_supply>0) cannot be bypassed by a stale field.
+    pool.total_fees_earned = 0;
+    pool.last_fee_accrual_slot = 0;
+    pool.last_vault_snapshot = 0;
+    pool.pool_mode = 0; // InitTradingPool overrides to 1 after this call
+    pool.pending_admin = [0u8; 32];
     pool.set_discriminator();
 
     msg!(
@@ -431,8 +446,13 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     let lp_to_mint = pool
         .calc_lp_for_deposit(amount)
         .ok_or(StakeError::Overflow)?;
+    // S-4: reject a zero-share mint EXPLICITLY (dedicated variant, not the generic
+    // ZeroAmount). A nonzero deposit that rounds to 0 LP at the current share price
+    // must never transfer collateral in while minting nothing. Share price derives
+    // from tracked counters (total_pool_value), never the raw vault balance, so a
+    // direct token donation cannot inflate it — see math::calc_lp_for_deposit.
     if lp_to_mint == 0 {
-        return Err(StakeError::ZeroAmount.into());
+        return Err(StakeError::ZeroSharesMinted.into());
     }
 
     // Transfer collateral: user ATA → stake vault
@@ -1115,6 +1135,104 @@ fn process_update_config(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 5: ProposeAdmin — step 1 of two-step admin rotation
+// ═══════════════════════════════════════════════════════════════
+
+/// The CURRENT admin proposes a new admin. Writes pool.pending_admin; grants the
+/// proposed admin NO authority until they call AcceptAdmin. Proposing the zero
+/// pubkey cancels an outstanding proposal. Mirrors the wrapper's authority-gated
+/// rotation style (current authority must sign), using the safe propose/accept
+/// idiom so a transfer can never strand the pool on a key nobody controls.
+fn process_propose_admin(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    new_admin: [u8; 32],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate pool account before bytemuck reinterpretation (matches every
+    // other admin path).
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    pool.pending_admin = new_admin;
+
+    if new_admin == [0u8; 32] {
+        msg!("ProposeAdmin: pending admin proposal cancelled");
+    } else {
+        msg!("ProposeAdmin: new admin proposed (awaiting AcceptAdmin)");
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 6: AcceptAdmin — step 2 of two-step admin rotation
+// ═══════════════════════════════════════════════════════════════
+
+/// The PENDING admin accepts the rotation and becomes admin. Requires an
+/// outstanding proposal (pending_admin != 0) and the signer to equal
+/// pending_admin. Clears pending_admin on success. Because the new admin must
+/// sign here, ownership can never be handed to a key that cannot act.
+fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let new_admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !new_admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+
+    // There must be an outstanding proposal to accept.
+    if pool.pending_admin == [0u8; 32] {
+        return Err(StakeError::NoPendingAdmin.into());
+    }
+    // Only the proposed admin may accept.
+    if pool.pending_admin != new_admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    pool.admin = pool.pending_admin;
+    pool.pending_admin = [0u8; 32];
+
+    msg!("AcceptAdmin: admin rotation complete");
+    Ok(())
+}
+
 // ============================================================================
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
@@ -1221,8 +1339,7 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         // total_fees_earned.  Reading it after the increment inflates the senior
         // weight in distribute_fees, systematically shortchanging the junior
         // tranche (~6% per cycle on equal balances with a 2x multiplier).
-        let distribute_to_junior =
-            pool.tranche_enabled() && pool.junior_total_lp() > 0;
+        let distribute_to_junior = pool.tranche_enabled() && pool.junior_total_lp() > 0;
         let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
             (
                 pool.junior_balance(),
@@ -1492,8 +1609,9 @@ fn process_deposit_junior(
     let junior_bal = pool.effective_junior_balance();
     let lp_to_mint = crate::math::calc_junior_lp_for_deposit(junior_lp, junior_bal, amount)
         .ok_or(StakeError::Overflow)?;
+    // S-4 (junior path): same dedicated zero-share reject as process_deposit.
     if lp_to_mint == 0 {
-        return Err(StakeError::ZeroAmount.into());
+        return Err(StakeError::ZeroSharesMinted.into());
     }
 
     invoke(
@@ -1679,8 +1797,8 @@ fn process_return_insurance(
     let accounts_iter = &mut accounts.iter();
     let admin = next_account_info(accounts_iter)?;
     let pool_pda = next_account_info(accounts_iter)?;
-    let admin_ata = next_account_info(accounts_iter)?;  // source
-    let vault = next_account_info(accounts_iter)?;       // destination
+    let admin_ata = next_account_info(accounts_iter)?; // source
+    let vault = next_account_info(accounts_iter)?; // destination
     let token_program = next_account_info(accounts_iter)?;
 
     if !admin.is_signer {
@@ -1747,7 +1865,8 @@ fn process_return_insurance(
     )?;
 
     // Update accounting
-    pool.total_returned = pool.total_returned
+    pool.total_returned = pool
+        .total_returned
         .checked_add(amount)
         .ok_or(StakeError::Overflow)?;
 
@@ -1763,10 +1882,7 @@ fn process_return_insurance(
 // 18: SetMarketResolved — admin marks pool as resolved
 // ═══════════════════════════════════════════════════════════════
 
-fn process_set_market_resolved(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
+fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let admin = next_account_info(accounts_iter)?;
     let pool_pda = next_account_info(accounts_iter)?;

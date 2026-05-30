@@ -47,6 +47,14 @@ pub enum StakeError {
     JuniorBalanceInsufficient = 20,
     /// Wrong tranche — deposit PDA already belongs to a different tranche
     WrongTranche = 21,
+    /// S-4: A deposit would mint zero LP shares (amount too small relative to
+    /// share price, or degenerate pool state). Rejected explicitly so a deposit
+    /// can never silently mint 0 LP while collateral is transferred in. Distinct
+    /// from ZeroAmount (which means the requested amount itself was 0).
+    ZeroSharesMinted = 22,
+    /// Two-step admin rotation: no pending admin proposal exists (or it was
+    /// cancelled), so AcceptAdmin has nothing to accept.
+    NoPendingAdmin = 23,
 }
 
 impl From<StakeError> for ProgramError {
@@ -81,6 +89,8 @@ pub fn error_hint(code: u32) -> &'static str {
         19 => "Tranches not enabled — senior/junior tranches are not enabled on this pool",
         20 => "Junior balance insufficient — junior tranche doesn't have enough balance for this operation",
         21 => "Wrong tranche — deposit already belongs to a different tranche",
+        22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
+        23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
         _ => "Unknown error — check the error code and pool state",
     }
 }
