@@ -413,3 +413,236 @@ fn flush_unbound_authority_rejected_with_unauthorized() {
     assert_eq!(token_amount(&env.svm, &env.stake_vault), FLUSH_AMOUNT);
     assert_eq!(token_amount(&env.svm, &env.wrapper_vault), 0);
 }
+
+// ── Two-step admin rotation (finding #4) — runtime, through the real program ──
+// Rotation only touches the pool PDA (no market/CPI), so we use a minimal pool.
+
+/// Load the stake program and craft a version-2 StakePool owned by it with the
+/// given admin. Returns (svm, stake_id, pool_pda).
+fn setup_pool_only(admin: &Pubkey) -> (LiteSVM, Pubkey, Pubkey) {
+    let mut svm = LiteSVM::new();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    svm.add_program_from_file(stake_id, &stake_so()).unwrap();
+    let slab = Pubkey::new_unique();
+    let (pool_pda, _) = derive_pool_pda(&stake_id, &slab);
+    let mut pool = StakePool::zeroed();
+    pool.is_initialized = 1;
+    pool.bump = 255;
+    pool.slab = slab.to_bytes();
+    pool.admin = admin.to_bytes();
+    pool.set_discriminator(); // discriminator + CURRENT_VERSION (2)
+    let mut bytes = vec![0u8; STAKE_POOL_SIZE];
+    bytes.copy_from_slice(bytemuck::bytes_of(&pool));
+    svm.set_account(
+        pool_pda,
+        Account {
+            lamports: 1_000_000_000,
+            data: bytes,
+            owner: stake_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    (svm, stake_id, pool_pda)
+}
+
+fn pool_admin(svm: &LiteSVM, pool_pda: &Pubkey) -> [u8; 32] {
+    let data = svm.get_account(pool_pda).unwrap().data;
+    let pool: &StakePool = bytemuck::from_bytes(&data[..STAKE_POOL_SIZE]);
+    pool.admin
+}
+
+fn propose_ix(
+    stake_id: Pubkey,
+    pool_pda: Pubkey,
+    admin: &Pubkey,
+    new_admin: [u8; 32],
+) -> Instruction {
+    let mut data = vec![5u8];
+    data.extend_from_slice(&new_admin);
+    Instruction {
+        program_id: stake_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new(pool_pda, false),
+        ],
+        data,
+    }
+}
+
+fn accept_ix(stake_id: Pubkey, pool_pda: Pubkey, new_admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: stake_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*new_admin, true),
+            AccountMeta::new(pool_pda, false),
+        ],
+        data: vec![6u8],
+    }
+}
+
+#[test]
+fn two_step_admin_rotation_happy_path() {
+    let admin = Keypair::new();
+    let new_admin = Keypair::new();
+    let payer = Keypair::new();
+    let (mut svm, stake_id, pool_pda) = setup_pool_only(&admin.pubkey());
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+    // propose (current admin signs)
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        propose_ix(
+            stake_id,
+            pool_pda,
+            &admin.pubkey(),
+            new_admin.pubkey().to_bytes(),
+        ),
+    )
+    .expect("ProposeAdmin");
+    assert_eq!(
+        pool_admin(&svm, &pool_pda),
+        admin.pubkey().to_bytes(),
+        "admin unchanged until accept"
+    );
+
+    // accept (pending admin signs) -> rotation
+    send(
+        &mut svm,
+        &payer,
+        &[&new_admin],
+        accept_ix(stake_id, pool_pda, &new_admin.pubkey()),
+    )
+    .expect("AcceptAdmin");
+    assert_eq!(
+        pool_admin(&svm, &pool_pda),
+        new_admin.pubkey().to_bytes(),
+        "admin rotated"
+    );
+
+    // old admin can no longer propose (Unauthorized=2)
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        propose_ix(
+            stake_id,
+            pool_pda,
+            &admin.pubkey(),
+            admin.pubkey().to_bytes(),
+        ),
+    )
+    .expect_err("old admin must be rejected");
+    assert!(matches!(
+        err,
+        TransactionError::InstructionError(_, InstructionError::Custom(2))
+    ));
+}
+
+#[test]
+fn accept_by_non_pending_signer_rejected() {
+    let admin = Keypair::new();
+    let new_admin = Keypair::new();
+    let attacker = Keypair::new();
+    let payer = Keypair::new();
+    let (mut svm, stake_id, pool_pda) = setup_pool_only(&admin.pubkey());
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        propose_ix(
+            stake_id,
+            pool_pda,
+            &admin.pubkey(),
+            new_admin.pubkey().to_bytes(),
+        ),
+    )
+    .expect("ProposeAdmin");
+
+    // attacker (not the pending admin) tries to accept -> Unauthorized=2
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&attacker],
+        accept_ix(stake_id, pool_pda, &attacker.pubkey()),
+    )
+    .expect_err("non-pending signer must be rejected");
+    assert!(matches!(
+        err,
+        TransactionError::InstructionError(_, InstructionError::Custom(2))
+    ));
+    assert_eq!(
+        pool_admin(&svm, &pool_pda),
+        admin.pubkey().to_bytes(),
+        "admin unchanged"
+    );
+}
+
+#[test]
+fn accept_with_no_pending_rejected() {
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    let (mut svm, stake_id, pool_pda) = setup_pool_only(&admin.pubkey());
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+    // no proposal outstanding -> AcceptAdmin reverts NoPendingAdmin=23
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        accept_ix(stake_id, pool_pda, &admin.pubkey()),
+    )
+    .expect_err("accept with no pending must revert");
+    assert!(matches!(
+        err,
+        TransactionError::InstructionError(_, InstructionError::Custom(23))
+    ));
+}
+
+#[test]
+fn propose_zero_cancels_pending() {
+    let admin = Keypair::new();
+    let new_admin = Keypair::new();
+    let payer = Keypair::new();
+    let (mut svm, stake_id, pool_pda) = setup_pool_only(&admin.pubkey());
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        propose_ix(
+            stake_id,
+            pool_pda,
+            &admin.pubkey(),
+            new_admin.pubkey().to_bytes(),
+        ),
+    )
+    .expect("ProposeAdmin");
+    // cancel by proposing the zero pubkey
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        propose_ix(stake_id, pool_pda, &admin.pubkey(), [0u8; 32]),
+    )
+    .expect("ProposeAdmin(zero) cancels");
+
+    // the previously-proposed admin can no longer accept -> NoPendingAdmin=23
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&new_admin],
+        accept_ix(stake_id, pool_pda, &new_admin.pubkey()),
+    )
+    .expect_err("accept after cancel must revert");
+    assert!(matches!(
+        err,
+        TransactionError::InstructionError(_, InstructionError::Custom(23))
+    ));
+}
