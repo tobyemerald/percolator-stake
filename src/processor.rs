@@ -144,6 +144,12 @@ pub fn process(
         StakeInstruction::RotateInsuranceAuthority => {
             process_rotate_insurance_authority(program_id, accounts)
         }
+        StakeInstruction::BurnAssetAdmin => {
+            process_burn_asset_admin(program_id, accounts)
+        }
+        StakeInstruction::RotateInsuranceOperator => {
+            process_rotate_insurance_operator(program_id, accounts)
+        }
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
@@ -1244,12 +1250,28 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 // insurance_authority to our vault_auth PDA (see cpi::cpi_bind_insurance_authority)
 // ═══════════════════════════════════════════════════════════════
 
-/// Admin-invoked one-time bind. CPIs the wrapper's UpdateAuthority(INSURANCE,
-/// vault_auth_pda): the admin co-signs as the CURRENT authority and our PDA
-/// co-signs (invoke_signed) as the NEW authority. This is the ONLY way to make
-/// the market's `insurance_authority` equal a PDA (v16 requires the new authority
-/// to sign, which a plain admin tx can't do for a PDA). Required once after
-/// market creation, before the first FlushToInsurance.
+/// Bind — two-CPI sequence that moves insurance_authority AND insurance_operator
+/// to the vault_auth PDA. Together these close BOTH drain paths in tag-57
+/// WithdrawInsuranceAsset:
+///
+///   (a) local_authorized = insurance_operator == operator → BLOCKED (operator=PDA≠admin)
+///   (b) admin_shutdown_authorized path → BLOCKED by D-STAKE-1 guard when
+///       insurance_authority != zero AND by the asset_index==0 guard.
+///
+/// After this call:
+///   - insurance_authority == vault_auth PDA
+///   - insurance_operator  == vault_auth PDA
+///
+/// The admin can still rotate these back IF they retain asset_admin. To irrevocably
+/// close this path, call BurnAssetAdmin (tag 21) AFTER this instruction. Together
+/// BindInsuranceAuthority + BurnAssetAdmin form the COMPLETE secure-bind sequence.
+///
+/// NOTE: the two CPIs are split from the admin-burn because BurnAssetAdmin is
+/// irreversible and only needed once per market. On a re-bind after a redeploy
+/// (RotateInsuranceAuthority + RotateInsuranceOperator back to admin, then re-bind
+/// from the new program), the admin burn is already done — calling BurnAssetAdmin
+/// again would fail (asset_admin already zero). Two separate instructions avoids
+/// that footgun while preserving atomicity of the authority moves.
 fn process_bind_insurance_authority(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1270,7 +1292,7 @@ fn process_bind_insurance_authority(
     validate_account_not_empty(pool_pda)?;
 
     // Read pool (immutable — we don't mutate stake state here) and copy out the
-    // fields we need so the borrow is released before the CPI.
+    // fields we need so the borrow is released before the CPIs.
     let (pool_slab, pool_percolator) = {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
@@ -1281,8 +1303,10 @@ fn process_bind_insurance_authority(
             return Err(StakeError::InvalidAccount.into());
         }
         validate_pool_version(pool)?;
-        // Admin-gated: only the pool admin may bind (and the admin must currently
-        // be the market's insurance_authority for the wrapper CPI to succeed).
+        // Admin-gated: only the pool admin may bind. At bind time the admin must
+        // be the current insurance_authority and insurance_operator (bootstrapped
+        // to marketauth=admin at InitMarket). Any divergence causes the wrapper
+        // CPI to reject with Unauthorized.
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
         }
@@ -1298,7 +1322,7 @@ fn process_bind_insurance_authority(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
-    // Derive + verify the vault_auth PDA (the new authority we bind).
+    // Derive + verify the vault_auth PDA (the new authority for both CPIs).
     let (expected_vault_auth, vault_auth_bump) =
         state::derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
@@ -1306,15 +1330,212 @@ fn process_bind_insurance_authority(
     }
 
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+    // CPI 1: bind insurance_authority (kind=1) → vault_auth PDA.
+    // Admin is the current insurance_authority; PDA co-signs via invoke_signed.
     cpi::cpi_bind_insurance_authority(
         percolator_program,
-        admin,      // current authority (== cfg.insurance_authority at bind time)
+        admin,      // current insurance_authority (== admin at bootstrap)
         vault_auth, // new authority (PDA), signed via invoke_signed
         slab,       // market
         vault_auth_seeds,
     )?;
 
-    msg!("BindInsuranceAuthority: market insurance_authority bound to vault_auth PDA");
+    // CPI 2: bind insurance_operator (kind=2) → vault_auth PDA.
+    // Admin is the current insurance_operator (bootstrapped to marketauth=admin).
+    // PDA co-signs as the new operator via invoke_signed. After this, admin cannot
+    // pass local_authorized in WithdrawInsuranceAsset (tag 57) because
+    // insurance_operator != admin.
+    cpi::cpi_bind_insurance_operator(
+        percolator_program,
+        admin,      // current insurance_operator (== admin at bootstrap)
+        vault_auth, // new operator (PDA), signed via invoke_signed
+        slab,       // market
+        vault_auth_seeds,
+    )?;
+
+    msg!("BindInsuranceAuthority: insurance_authority + insurance_operator bound to vault_auth PDA — local_authorized drain path blocked. Call BurnAssetAdmin (tag 21) to irrevocably seal.");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 21: BurnAssetAdmin — irrevocably remove admin's rotate-back capability
+// ═══════════════════════════════════════════════════════════════
+
+/// BurnAssetAdmin burns the market's asset_admin (kind=0) to [0;32], permanently
+/// removing the admin's ability to rotate insurance_operator (or any other per-asset
+/// authority) back to an admin-controlled key.
+///
+/// This is the FINAL HARDENING step of the secure-bind sequence:
+///   1. BindInsuranceAuthority — moves authority + operator to PDA
+///   2. BurnAssetAdmin         — burns the admin's rotate-back escape hatch
+///
+/// After BurnAssetAdmin:
+///   - asset_admin == [0;32] (no key can rotate per-asset authorities for this asset)
+///   - Only the current holder of each authority can self-rotate it
+///   - The PDA (vault_auth) is permanently the insurance_authority and insurance_operator
+///     until a RotateInsuranceAuthority / RotateInsuranceOperator escape is exercised
+///
+/// IRREVERSIBILITY: asset_admin [0;32] can never be restored. This is intentional.
+/// Once burned, the secure state is locked. Only call this when committed.
+///
+/// IDEMPOTENT GUARD: call this EXACTLY ONCE per market. Calling it when asset_admin
+/// is already zero causes a wrapper Unauthorized error (the wrapper's
+/// expect_live_authority check fails on a zero key — it cannot sign).
+///
+/// Accounts:
+///   0. `[signer, writable]` Admin (current asset_admin == pool.admin)
+///   1. `[]` Pool PDA (read, validates admin)
+///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
+///   3. `[writable]` Slab / market account (wrapper-owned)
+///   4. `[]` Percolator program
+fn process_burn_asset_admin(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let (pool_slab, pool_percolator) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        (pool.slab, pool.percolator_program)
+    };
+
+    if pool_slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool_percolator != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // vault_auth is passed as a placeholder new_authority slot (not checked by the wrapper
+    // when new_pubkey=[0;32]; only admin must sign as the current asset_admin).
+    // We do NOT need vault_auth to be the actual vault_auth PDA here (any account works),
+    // but we use it for consistency and to avoid introducing a new account slot.
+    let (expected_vault_auth, _) = state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    cpi::cpi_burn_asset_admin(
+        percolator_program,
+        admin,      // current asset_admin; signer
+        vault_auth, // placeholder slot (not checked for zero-burn)
+        slab,       // market
+    )?;
+
+    msg!("BurnAssetAdmin: asset_admin burned to zero — admin's rotate-back capability permanently removed");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 22: RotateInsuranceOperator — PDA signs to move operator off
+// ═══════════════════════════════════════════════════════════════
+
+/// Admin-gated rotation of the market's `insurance_operator` OFF our `vault_auth`
+/// PDA to an admin-specified `new_target`. CPIs UpdateAssetAuthority(kind=2,
+/// new_target) with the PDA signing as the CURRENT operator (invoke_signed) and
+/// `new_target` co-signing the outer tx as the NEW operator.
+///
+/// This is the migration escape for the insurance_operator, analogous to
+/// RotateInsuranceAuthority (tag 20) for insurance_authority. The full no-lockout
+/// migration sequence on a redeploy:
+///   1. RotateInsuranceAuthority (tag 20): insurance_authority PDA_A → admin wallet
+///   2. RotateInsuranceOperator  (tag 22): insurance_operator  PDA_A → admin wallet
+///   3. Re-bind from NEW program: BindInsuranceAuthority (tags 19) binds both to PDA_B
+///   4. BurnAssetAdmin only if not already burned (idempotent guard applies)
+///
+/// Accounts:
+///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
+///   1. `[]` Pool PDA
+///   2. `[]` Vault authority PDA (the CURRENT operator; signed via CPI invoke_signed)
+///   3. `[signer]` New target operator (co-signs the outer tx)
+///   4. `[writable]` Slab / market account (wrapper-owned)
+///   5. `[]` Percolator program
+fn process_rotate_insurance_operator(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let new_target = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    // The wrapper requires the NEW operator to co-sign for non-zero keys.
+    if !new_target.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let (pool_slab, pool_percolator) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        (pool.slab, pool.percolator_program)
+    };
+
+    if pool_slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool_percolator != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    cpi::cpi_rotate_insurance_operator(
+        percolator_program,
+        vault_auth, // current operator (the PDA), signed via invoke_signed
+        new_target, // new operator (admin-specified), co-signs the outer tx
+        slab,       // market
+        vault_auth_seeds,
+    )?;
+
+    msg!("RotateInsuranceOperator: insurance_operator rotated off vault_auth PDA to new target");
     Ok(())
 }
 

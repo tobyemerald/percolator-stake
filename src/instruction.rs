@@ -111,6 +111,43 @@ pub enum StakeInstruction {
     ///   5. `[]` Percolator program
     RotateInsuranceAuthority,
 
+    /// 21: BurnAssetAdmin — irrevocably remove the admin's rotate-back capability.
+    /// Calls UpdateAssetAuthority(kind=0, new_pubkey=[0;32]) to burn asset_admin to
+    /// zero. After this, no key can rotate any per-asset authority (insurance,
+    /// operator, backing, oracle) back to an admin-controlled key. Only the current
+    /// holder of each authority can self-rotate it.
+    ///
+    /// IRREVERSIBLE. Only call this after BindInsuranceAuthority has completed.
+    /// Must NOT be called again if asset_admin is already zero (causes Unauthorized).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (current asset_admin == pool.admin)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    BurnAssetAdmin,
+
+    /// 22: RotateInsuranceOperator — admin-gated migration escape for the
+    /// insurance_operator. Analogous to RotateInsuranceAuthority (tag 20) but for
+    /// kind=2 (ASSET_AUTH_INSURANCE_OPERATOR). The vault_auth PDA signs as the
+    /// CURRENT operator (invoke_signed); new_target co-signs the outer tx.
+    ///
+    /// Part of the full no-lockout migration sequence:
+    ///   1. RotateInsuranceAuthority (tag 20): authority PDA → admin wallet
+    ///   2. RotateInsuranceOperator  (tag 22): operator  PDA → admin wallet
+    ///   3. Re-bind from NEW program (BindInsuranceAuthority, tag 19)
+    ///   4. BurnAssetAdmin (tag 21) — only if not already burned
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the CURRENT operator; signed via CPI)
+    ///   3. `[signer]` New target operator (co-signs the outer tx)
+    ///   4. `[writable]` Slab / market account (wrapper-owned)
+    ///   5. `[]` Percolator program
+    RotateInsuranceOperator,
+
     /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
@@ -299,6 +336,8 @@ impl StakeInstruction {
             // Tags 7-9, 11 tombstoned — were admin CPI proxies, now removed.
             19 => Ok(Self::BindInsuranceAuthority),
             20 => Ok(Self::RotateInsuranceAuthority),
+            21 => Ok(Self::BurnAssetAdmin),
+            22 => Ok(Self::RotateInsuranceOperator),
             10 => {
                 if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);

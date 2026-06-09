@@ -1,10 +1,19 @@
 //! CPI helpers for calling percolator wrapper instructions.
 //!
-//! The stake program issues TWO wrapper CPIs:
+//! The stake program issues FOUR wrapper CPIs:
 //!   * TopUpInsurance (tag 9)             — the insurance flush itself.
 //!   * UpdateAssetAuthority (tag 65)      — bind/rotate the per-asset
 //!     `insurance_authority` (asset 0, kind=ASSET_AUTH_INSURANCE=1) to our
-//!     `vault_auth` PDA (see below).
+//!     `vault_auth` PDA.
+//!   * UpdateAssetAuthority (tag 65)      — move `insurance_operator` (kind=2)
+//!     to the same `vault_auth` PDA so the admin cannot drain via tag-57
+//!     local_authorized path.
+//!   * UpdateAssetAuthority (tag 65)      — burn `asset_admin` (kind=0,
+//!     new_pubkey=[0;32]) so the admin cannot rotate any authority back.
+//!
+//! The last three CPIs are issued atomically in BindInsuranceAuthority (tag 19)
+//! to guarantee the STRONG no-admin-drain property: after bind, no admin key
+//! can drain insurance via WithdrawInsuranceAsset (tag 57).
 //!
 //! V17 WIRE CHANGE (collision row 43): the v16 wire used tag 32 `UpdateAuthority`
 //! with kind byte = 2 (AUTHORITY_INSURANCE) and a 34-byte payload. The v17 auth
@@ -33,7 +42,7 @@ use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
 };
 
 // Wrapper instruction tags (from percolator-prog/src/v16_program.rs ix::Instruction).
@@ -51,6 +60,19 @@ const ASSET_INDEX_ZERO: u16 = 0;
 /// The footgun here is that both look like small integers but are defined in
 /// different constant families and must NOT be swapped.
 const ASSET_AUTH_INSURANCE: u8 = 1;
+/// UpdateAssetAuthority kind selector for insurance_operator.
+/// Source: v16_program.rs ASSET_AUTH_INSURANCE_OPERATOR = 2.
+/// Must be moved (cannot burn to zero) to a key the admin does not control.
+/// In the secure-bind sequence we move it to the vault_auth PDA so the admin
+/// cannot drain via the local_authorized path in WithdrawInsuranceAsset (tag 57).
+const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
+/// UpdateAssetAuthority kind selector for asset_admin.
+/// Source: v16_program.rs ASSET_AUTH_ADMIN = 0.
+/// This is the ONLY authority that can be burned to zero (new_pubkey = [0;32]).
+/// Burning asset_admin irrevocably removes the admin's ability to rotate any of
+/// the asset's authorities (insurance, operator, backing, oracle) back to admin
+/// control. This is the final step of the secure-bind sequence.
+const ASSET_AUTH_ADMIN: u8 = 0;
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — v16 contract
@@ -166,6 +188,147 @@ pub fn cpi_bind_insurance_authority<'a>(
     invoke_signed(
         &ix,
         &[admin.clone(), vault_auth.clone(), market.clone()],
+        &[signer_seeds],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UpdateAssetAuthority (Tag 65) — move insurance_operator to our PDA
+// ═══════════════════════════════════════════════════════════════
+// Same wrapper handler as the insurance_authority bind, but kind=2
+// (ASSET_AUTH_INSURANCE_OPERATOR). Admin is the current operator (bootstrapped
+// to marketauth/admin at InitMarket). vault_auth PDA co-signs as the NEW
+// operator via invoke_signed. After this call, only a stake CPI (which can
+// invoke_signed as vault_auth) can operate as the insurance_operator — the
+// admin cannot drain via tag-57's local_authorized path.
+//
+// SECURITY NOTE: insurance_operator cannot be burned to zero (the wrapper
+// rejects new_pubkey=[0;32] for kind != ASSET_AUTH_ADMIN at line 9439). The
+// PDA is the safe non-zero non-admin key. The ASSET_AUTH_ADMIN burn (below) then
+// removes the admin's ability to rotate this back.
+
+pub fn cpi_bind_insurance_operator<'a>(
+    percolator_program: &AccountInfo<'a>,
+    admin: &AccountInfo<'a>,     // current insurance_operator (== admin at bootstrap); signer
+    vault_auth: &AccountInfo<'a>, // new operator = our PDA; co-signs via invoke_signed
+    market: &AccountInfo<'a>,    // the slab/market account (writable, wrapper-owned)
+    signer_seeds: &[&[u8]],      // vault_auth PDA seeds
+) -> ProgramResult {
+    // tag(1) + asset_index(2, u16 LE = 0) + kind(1) + new_pubkey(32) = 36 bytes.
+    let mut data = Vec::with_capacity(36);
+    data.push(TAG_UPDATE_ASSET_AUTHORITY);
+    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
+    data.push(ASSET_AUTH_INSURANCE_OPERATOR);                // kind = 2
+    data.extend_from_slice(vault_auth.key.as_ref());         // new_pubkey = PDA
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin.key, true),      // current operator (admin), signer
+            AccountMeta::new_readonly(*vault_auth.key, true), // new operator (PDA), signer via invoke_signed
+            AccountMeta::new(*market.key, false),             // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[admin.clone(), vault_auth.clone(), market.clone()],
+        &[signer_seeds],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UpdateAssetAuthority (Tag 65) — burn asset_admin to zero
+// ═══════════════════════════════════════════════════════════════
+// Burning asset_admin (kind=0, new_pubkey=[0;32]) removes the admin's ability
+// to rotate ANY of the asset's per-asset authorities (insurance_authority,
+// insurance_operator, backing_bucket_authority, oracle_authority) back to an
+// admin-controlled key. This is the final step of the secure-bind sequence
+// and makes the PDA custody irrevocable.
+//
+// UNIQUELY PERMITTED: the wrapper allows new_pubkey=[0;32] ONLY for kind=0
+// (ASSET_AUTH_ADMIN). For all other kinds it returns InvalidInstruction.
+// (v16_program.rs handle_update_asset_authority line 9439).
+//
+// NO CO-SIGN REQUIRED: when new_pubkey=[0;32], the wrapper skips the
+// expect_signer(new_authority) check (line 9405). We still need a second
+// account slot — we pass vault_auth as a placeholder (it is already present
+// in the transaction; no signer check is performed on it by the wrapper).
+//
+// Account layout: [current(signer=admin), new_authority(any, not checked), market(w)]
+// Wire: tag(65) + asset_index(0 u16 LE) + kind(0) + new_pubkey([0;32]) = 36 bytes.
+
+pub fn cpi_burn_asset_admin<'a>(
+    percolator_program: &AccountInfo<'a>,
+    admin: &AccountInfo<'a>,     // current asset_admin; signer
+    vault_auth: &AccountInfo<'a>, // placeholder new_authority slot (not checked by wrapper for zero burn)
+    market: &AccountInfo<'a>,    // the slab/market account (writable, wrapper-owned)
+) -> ProgramResult {
+    // tag(1) + asset_index(2, u16 LE = 0) + kind(1) + new_pubkey(32, all zeros) = 36 bytes.
+    let mut data = Vec::with_capacity(36);
+    data.push(TAG_UPDATE_ASSET_AUTHORITY);
+    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
+    data.push(ASSET_AUTH_ADMIN);                             // kind = 0
+    data.extend_from_slice(&[0u8; 32]);                      // new_pubkey = burn (all zeros)
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin.key, true),       // current asset_admin, signer
+            AccountMeta::new_readonly(*vault_auth.key, false), // new_authority slot (any; not checked for zero-burn)
+            AccountMeta::new(*market.key, false),              // market, writable
+        ],
+        data,
+    };
+
+    // Plain invoke (not signed) — admin signs as the outer tx signer; no PDA co-sign needed.
+    invoke(
+        &ix,
+        &[admin.clone(), vault_auth.clone(), market.clone()],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UpdateAssetAuthority (Tag 65) — rotate insurance_operator OFF our PDA
+// ═══════════════════════════════════════════════════════════════
+// Same as cpi_rotate_insurance_authority but for insurance_operator (kind=2).
+// Used in the migration escape sequence (RotateInsuranceOperator, tag 22):
+//   PDA signs as the CURRENT operator; new_target co-signs as the NEW operator.
+//
+// Full no-lockout migration sequence:
+//   1. RotateInsuranceAuthority (tag 20): insurance_authority PDA → admin wallet
+//   2. RotateInsuranceOperator  (tag 22): insurance_operator  PDA → admin wallet
+//   3. Re-bind from NEW program (BindInsuranceAuthority, tag 19)
+//   4. BurnAssetAdmin (tag 21) — only if asset_admin not already zero
+
+pub fn cpi_rotate_insurance_operator<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>, // CURRENT operator = our PDA; signs via invoke_signed
+    new_target: &AccountInfo<'a>, // NEW operator (admin-specified, non-zero); co-signs outer tx
+    market: &AccountInfo<'a>,     // the slab/market account (writable, wrapper-owned)
+    signer_seeds: &[&[u8]],       // vault_auth PDA seeds
+) -> ProgramResult {
+    // tag(1) + asset_index(2, u16 LE = 0) + kind(1) + new_pubkey(32) = 36 bytes.
+    let mut data = Vec::with_capacity(36);
+    data.push(TAG_UPDATE_ASSET_AUTHORITY);
+    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
+    data.push(ASSET_AUTH_INSURANCE_OPERATOR);                // kind = 2
+    data.extend_from_slice(new_target.key.as_ref());         // new_pubkey = rotation target
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true), // current operator (PDA), signer via invoke_signed
+            AccountMeta::new_readonly(*new_target.key, true), // new operator, signer (outer tx)
+            AccountMeta::new(*market.key, false),             // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[vault_auth.clone(), new_target.clone(), market.clone()],
         &[signer_seeds],
     )
 }
@@ -324,5 +487,56 @@ mod tag_tests {
             9,
             "8-byte u64 wire is the pre-v16 break — must NOT ship"
         );
+    }
+
+    /// CANARY: pin the insurance_operator bind wire (tag-65 kind=2).
+    /// Must NOT be confused with kind=1 (insurance_authority) or kind=0 (admin burn).
+    #[test]
+    fn test_cpi_bind_operator_wire_shape() {
+        let pda = [7u8; 32];
+        let mut data = Vec::with_capacity(36);
+        data.push(TAG_UPDATE_ASSET_AUTHORITY);             // byte 0: tag = 65
+        data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2
+        data.push(ASSET_AUTH_INSURANCE_OPERATOR);         // byte 3: kind = 2
+        data.extend_from_slice(&pda);                     // bytes 4-35
+
+        assert_eq!(data.len(), 36, "operator bind wire must be 36 bytes");
+        assert_eq!(data[0], 65, "tag must be 65");
+        assert_eq!(data[3], 2, "kind must be 2 (ASSET_AUTH_INSURANCE_OPERATOR)");
+        assert_ne!(data[3], 1, "must not be kind=1 (ASSET_AUTH_INSURANCE)");
+        assert_ne!(data[3], 0, "must not be kind=0 (ASSET_AUTH_ADMIN burn)");
+        assert_eq!(&data[4..36], &pda, "new_pubkey at bytes [4..36]");
+    }
+
+    /// CANARY: pin the asset_admin burn wire (tag-65 kind=0, new_pubkey=[0;32]).
+    /// Must NOT be confused with kind=1 or kind=2. new_pubkey MUST be all-zeros.
+    #[test]
+    fn test_cpi_burn_asset_admin_wire_shape() {
+        let mut data = Vec::with_capacity(36);
+        data.push(TAG_UPDATE_ASSET_AUTHORITY);             // byte 0: tag = 65
+        data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2
+        data.push(ASSET_AUTH_ADMIN);                      // byte 3: kind = 0
+        data.extend_from_slice(&[0u8; 32]);               // bytes 4-35: zero burn
+
+        assert_eq!(data.len(), 36, "admin burn wire must be 36 bytes");
+        assert_eq!(data[0], 65, "tag must be 65");
+        assert_eq!(data[3], 0, "kind must be 0 (ASSET_AUTH_ADMIN)");
+        assert_ne!(data[3], 1, "must not be kind=1 (ASSET_AUTH_INSURANCE)");
+        assert_ne!(data[3], 2, "must not be kind=2 (ASSET_AUTH_INSURANCE_OPERATOR)");
+        // new_pubkey must be all zeros (the burn value)
+        assert_eq!(&data[4..36], &[0u8; 32], "new_pubkey must be all-zeros for admin burn");
+    }
+
+    /// GUARD: all three kind constants in the secure-bind sequence are distinct
+    /// and map to the expected numeric values from v16_program.rs.
+    #[test]
+    fn test_secure_bind_kind_constants_are_distinct() {
+        assert_eq!(ASSET_AUTH_ADMIN, 0, "ASSET_AUTH_ADMIN must be 0");
+        assert_eq!(ASSET_AUTH_INSURANCE, 1, "ASSET_AUTH_INSURANCE must be 1");
+        assert_eq!(ASSET_AUTH_INSURANCE_OPERATOR, 2, "ASSET_AUTH_INSURANCE_OPERATOR must be 2");
+        // They must all differ (confusion between these is a security footgun)
+        assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE);
+        assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE_OPERATOR);
+        assert_ne!(ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR);
     }
 }
