@@ -359,7 +359,10 @@ fn init_market_wire_is_219_bytes() {
 /// HAPPY PATH: bind the insurance authority, then flush. The flush moves real
 /// SPL tokens stake_vault -> wrapper_vault, which (per the v16 handler ordering)
 /// proves the insurance credit + validate_shape succeeded across the boundary.
+/// SUPERSEDED by `flush_applies_insurance_after_bind_v17` in v17_stake_insurance_e2e.rs
+/// (v17 wrapper uses 2987B market size; this test hardcodes the old v16 3107B size).
 #[test]
+#[ignore = "v16 3107B layout superseded by v17 2987B; see flush_applies_insurance_after_bind_v17"]
 fn flush_applies_insurance_after_bind() {
     let mut env = Env::setup();
 
@@ -392,7 +395,9 @@ fn flush_applies_insurance_after_bind() {
 /// CPI signer is the vault_auth PDA -> the wrapper rejects at the OPERATIVE
 /// authority gate with Custom(8) Unauthorized. Must NOT be Custom(21)
 /// EngineLockActive (market is Live) nor InvalidInstructionData (wire is 16-byte).
+/// SUPERSEDED by the v17 e2e (no_admin_drain_before_and_after_bind); v16 3107B layout.
 #[test]
+#[ignore = "v16 3107B layout superseded by v17 2987B; negative path covered by v17 e2e"]
 fn flush_unbound_authority_rejected_with_unauthorized() {
     let mut env = Env::setup();
     // deliberately skip bind_ix
@@ -834,7 +839,11 @@ fn read_at(svm: &LiteSVM, market: &Pubkey, off: usize) -> [u8; 32] {
 /// wallet, confirm the OLD PDA can no longer flush, then re-bind from the NEW
 /// program and flush again. The final flush is what proves the bind is NOT a
 /// permanent weld.
+/// SUPERSEDED by `no_lockout_rotate_then_rebind_from_new_program_v17` in
+/// v17_stake_insurance_e2e.rs (v17 wrapper uses 2987B market size; this test
+/// hardcodes the old v16 3107B size via build_live_market/MARKET_LEN_CAP1).
 #[test]
+#[ignore = "v16 3107B layout superseded by v17 2987B; see no_lockout_rotate_then_rebind_from_new_program_v17"]
 fn no_lockout_rotate_then_rebind_from_new_program() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
