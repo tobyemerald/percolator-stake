@@ -2295,11 +2295,6 @@ fn process_admin_set_hwm_config(
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
 
-    // Validate hwm_floor_bps before modifying state
-    if enabled {
-        validate_hwm_floor_bps(hwm_floor_bps)?;
-    }
-
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
 
@@ -2312,8 +2307,15 @@ fn process_admin_set_hwm_config(
     }
     // FINDING-5: Validate pool version on AdminSetHwmConfig.
     validate_pool_version(pool)?;
+    // N-11: auth check BEFORE parameter validation. Previously validate_hwm_floor_bps
+    // fired before the admin identity check, letting any signer distinguish in-range vs
+    // out-of-range hwm_floor_bps values from InvalidArgument vs Unauthorized. Move the
+    // validation after the auth check so only the actual admin can probe the bounds.
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
+    }
+    if enabled {
+        validate_hwm_floor_bps(hwm_floor_bps)?;
     }
 
     // #185: only write the floor when ENABLING. Disabling must preserve the
