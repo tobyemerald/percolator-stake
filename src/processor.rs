@@ -2083,7 +2083,14 @@ fn pre_accrue_mode1(pool: &mut state::StakePool, vault: &AccountInfo) -> Program
         }
         let current_balance = {
             let vault_data = vault.try_borrow_data()?;
-            crate::spl_token::state::Account::unpack(&vault_data)?.amount
+            let acct = crate::spl_token::state::Account::unpack(&vault_data)?;
+            // N-8: reject non-Initialized vault (Uninitialized or Frozen). Our
+            // Account::unpack does not error on these states; an explicit check here
+            // ensures fee accounting only runs against a live, transferable token account.
+            if acct.state != crate::spl_token::state::AccountState::Initialized {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            acct.amount
         };
         accrue_fees_inner(pool, current_balance)?;
     }
@@ -2234,6 +2241,13 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     // Read vault token account balance (key and owner already verified above)
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
+    // N-8: reject non-Initialized vault. Account::unpack does not error on
+    // Uninitialized/Frozen; an explicit check ensures AccrueFees only runs against
+    // a live token account (Frozen state is impossible today since freeze_authority=None,
+    // but this guard is future-safe if Token-2022 or a refactor changes that invariant).
+    if vault_state.state != crate::spl_token::state::AccountState::Initialized {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let current_balance = vault_state.amount;
 
     let clock = Clock::from_account_info(clock_ai)?;
